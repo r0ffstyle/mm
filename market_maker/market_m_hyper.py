@@ -10,6 +10,7 @@ import signal
 
 from market_maker import bitmex
 from market_maker import binance
+from market_maker import hyperliquid
 from market_maker.settings import settings
 from market_maker.utils import log, constants, errors, math
 
@@ -40,6 +41,9 @@ class ExchangeInterface:
         self.binance_symbol = "BTCUSDT"
         self.binance = binance.Binance(self.binance_symbol)
         self.binance.connect()
+        """Connect to HyperLiquid"""
+        self.hyper_symbol = "BTC"
+        self.hyperliquid = hyperliquid.HyperLiquid(self.hyper_symbol)
 
     def get_binance_order_book(self):
         return self.binance.get_order_book()
@@ -49,7 +53,7 @@ class ExchangeInterface:
         logger.info("Canceling: %s %d @ %.*f" % (order['side'], order['orderQty'], tickLog, order['price']))
         while True:
             try:
-                self.bitmex.cancel(order['orderID'])
+                self.hyperliquid.cancel(order['orderID'])
                 sleep(settings.API_REST_INTERVAL)
             except ValueError as e:
                 logger.info(e)
@@ -66,13 +70,13 @@ class ExchangeInterface:
 
         # In certain cases, a WS update might not make it through before we call this.
         # For that reason, we grab via HTTP to ensure we grab them all.
-        orders = self.bitmex.http_open_orders()
+        orders = self.hyperliquid.get_open_orders()
 
         for order in orders:
             logger.info("Canceling: %s %d @ %.*f" % (order['side'], order['orderQty'], tickLog, order['price']))
 
         if len(orders):
-            self.bitmex.cancel([order['orderID'] for order in orders])
+            self.hyperliquid.cancel_order([order['orderID'] for order in orders])
 
         sleep(settings.API_REST_INTERVAL)
 
@@ -80,30 +84,7 @@ class ExchangeInterface:
         contracts = settings.CONTRACTS
         portfolio = {}
         for symbol in contracts:
-            position = self.bitmex.position(symbol=symbol)
-            instrument = self.bitmex.instrument(symbol=symbol)
-
-            if instrument['isQuanto']:
-                future_type = "Quanto"
-            elif instrument['isInverse']:
-                future_type = "Inverse"
-            elif not instrument['isQuanto'] and not instrument['isInverse']:
-                future_type = "Linear"
-            else:
-                raise NotImplementedError("Unknown future type; not quanto or inverse: %s" % instrument['symbol'])
-
-            if 'underlyingToSettleMultiplier' not in instrument or instrument['underlyingToSettleMultiplier'] is None:
-                multiplier = float(instrument['multiplier']) / float(instrument['quoteToSettleMultiplier'])
-            else:
-                multiplier = float(instrument['multiplier']) / float(instrument['underlyingToSettleMultiplier'])
-
-            portfolio[symbol] = {
-                "currentQty": float(position['currentQty']),
-                "futureType": future_type,
-                "multiplier": multiplier,
-                "markPrice": float(instrument['markPrice']),
-                "spot": float(instrument['indicativeSettlePrice'])
-            }
+            portfolio[self.hyper_symbol] = self.hyperliquid.position(symbol=symbol)
 
         return portfolio
 
@@ -112,17 +93,8 @@ class ExchangeInterface:
         portfolio = self.get_portfolio()
         spot_delta = 0
         mark_delta = 0
-        for symbol in portfolio:
-            item = portfolio[symbol]
-            if item['futureType'] == "Quanto":
-                spot_delta += item['currentQty'] * item['multiplier'] * item['spot']
-                mark_delta += item['currentQty'] * item['multiplier'] * item['markPrice']
-            elif item['futureType'] == "Inverse":
-                spot_delta += (item['multiplier'] / item['spot']) * item['currentQty']
-                mark_delta += (item['multiplier'] / item['markPrice']) * item['currentQty']
-            elif item['futureType'] == "Linear":
-                spot_delta += item['multiplier'] * item['currentQty']
-                mark_delta += item['multiplier'] * item['currentQty']
+        spot_delta += item['multiplier'] * item['currentQty']
+        mark_delta += item['multiplier'] * item['currentQty']
         basis_delta = mark_delta - spot_delta
         delta = {
             "spot": spot_delta,
@@ -228,6 +200,7 @@ class OrderManager:
             print(f"Invalid ORDER_START_SIZE, must be divisible by lotSize of {self.exchange.symbol} instrument")
             print(f"Setting ORDER_START_SIZE to lotSize of {self.exchange.symbol}: {self.instrument['lotSize']}")
             settings.ORDER_START_SIZE = self.instrument['lotSize']
+            
 
         if settings.ORDER_STEP_SIZE % self.instrument['lotSize'] != 0 or settings.ORDER_STEP_SIZE < self.instrument['lotSize']:
             print(f"Invalid ORDER_STEP_SIZE, must be divisible by lotSize of {self.exchange.symbol} instrument")
