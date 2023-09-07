@@ -10,6 +10,8 @@ import signal
 
 from market_maker import bitmex
 from market_maker import binance
+import market_maker.auth.poloniex_keys as polo_api
+from market_maker.poloniex import PoloniexWebsocket
 from market_maker.settings import settings
 from market_maker.utils import log, constants, errors, math
 
@@ -31,19 +33,46 @@ class ExchangeInterface:
             self.symbol = sys.argv[1]
         else:
             self.symbol = settings.SYMBOL
+
         """Connect to BitMex"""
         self.bitmex = bitmex.BitMEX(base_url=settings.BASE_URL, symbol=self.symbol,
                                     apiKey=settings.API_KEY, apiSecret=settings.API_SECRET,
                                     orderIDPrefix=settings.ORDERID_PREFIX, postOnly=settings.POST_ONLY,
                                     timeout=settings.TIMEOUT)
+        
         """Connect to Binance"""
         self.binance_symbol = "BTCUSDT"
         self.binance = binance.Binance(self.binance_symbol)
-        self.binance.connect()
+        sleep(5) # Make sure the Binance WebSocket has time to connect
+        
+        """Connect to Poloniex"""
+        self.poloniex = PoloniexWebsocket("BTC_USDT", polo_api.API_KEY, polo_api.API_SECRET)
+        self.poloniex.connect()
 
+
+    """Binance methods"""
     def get_binance_order_book(self):
         return self.binance.get_order_book()
+    
+    def get_5min_volatility(self):
+        return self.binance.get_volatility()
+    
+    def get_market_buy_orders(self):
+        return self.binance.get_market_buy_orders()
+    
+    def get_market_sell_orders(self):
+        return self.binance.get_market_sell_orders()
+    
+    """Poloniex methods"""
+    def get_polo_order_book(self):
+        book = self.poloniex.get_order_book()
+        if book['data']['action'] == 'snapshot':
+            return book
+    
+    def get_polo_ticker(self):
+        return self.poloniex.get_ticker()
 
+    """BitMex methods"""
     def cancel_order(self, order):
         tickLog = self.get_instrument()['tickLog']
         logger.info("Canceling: %s %d @ %.*f" % (order['side'], order['orderQty'], tickLog, order['price']))
