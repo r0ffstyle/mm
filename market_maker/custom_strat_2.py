@@ -1,40 +1,27 @@
-import math
+import sys
 import numpy as np
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.linear_model import LogisticRegression
+
+from market_maker.market_maker import OrderManager
+from market_maker.settings import settings
 from glft import GLFT
 
-class AdvancedPricePredictor:
-    def __init__(self, window_size=50):
-        """Initialize the price predictor with a given window size."""
-        self.window_size = window_size
-        self.model = GradientBoostingRegressor()
+from apricepred import AdvancedPricePredictor
 
-    def train(self, features, targets):
-        """Train the price predictor using historical features and targets."""
-        self.model.fit(features, targets)
+from sklearn.linear_model import LogisticRegression
 
-    def predict(self, recent_features):
-        """Predict the next price movement based on recent features."""
-        return self.model.predict([recent_features])
 
-class HFTMarketMaker:
-    def __init__(self, initial_levels=10, distance_between_levels=0.5):
-        """Initialize the market maker with default parameters and models."""
-        self.exchange = XYZExchangeAPI()
+class CustomOrderManager(OrderManager):
+    def __init__(self, exchange_api):
+        super().__init__(exchange_api)
         self.inventory = 0
         self.short_term_alpha = 0
         self.ema_alpha = 0.1
         self.predictor = AdvancedPricePredictor()
         self.sigma = 0.1  # Placeholder for stock's volatility
         self.rho = 0.05  # Placeholder for risk-free rate
-        self.T = 1  # Placeholder for terminal time SHOULD NOT BE NEEDED
         self.execution_data = self.load_execution_data()
         self.execution_model = self.train_execution_model()
-        self.initial_levels = initial_levels
-        self.distance_between_levels = distance_between_levels
-        self.initialize_orders()
-        self.glft = GLFT(A=self.mo_arrival_rate(), theta=0.5, sigma=0.1, Q=10, T=1) # GLFT optimal bid/ask quotes
+        self.glft = GLFT(A=self.mo_arrival_rate(), theta=0.5, sigma=0.1, Q=10, T=1)  # GLFT optimal bid/ask quotes
 
     def initialize_orders(self):
         """Place orders at multiple levels away from the current price for queue positioning."""
@@ -127,6 +114,31 @@ class HFTMarketMaker:
         spread = order_book['asks'][0]['price'] - order_book['bids'][0]['price']
         return bid_depth, ask_depth, spread
 
+    def place_orders(self) -> None:
+        """Create the orders to converge"""
+        buy_orders = []
+        sell_orders = []
+
+        self.update_short_term_alpha()
+        self.manage_inventory()
+
+        # We make orders from the outer parts towards the middle.
+        for i in reversed(range(1, settings.ORDER_PAIRS + 1)):
+            if not self.long_position_limit_exceeded():
+                buy_orders.append(self.prep_order(-i))
+            if not self.short_position_limit_exceeded():
+                sell_orders.append(self.prep_order(i))
+
+        # Converge the orders
+        self.converge_orders(buy_orders, sell_orders)
+
+    def prep_order(self, index):
+        """Prepare the order"""
+        quantity = settings.ORDER_START_SIZE + ((abs(index) - 1) * settings.ORDER_STEP_SIZE)
+        price = self.get_price(index)
+
+        return {'price': price, 'orderQty': quantity, 'side': "Buy" if index < 0 else "Sell"}
+
     def manage_inventory(self):
         """Manage the current inventory by posting buy or sell orders based on predicted price movement."""
         predicted_movement = self.predict_price_movement()
@@ -160,9 +172,23 @@ class HFTMarketMaker:
                 # Here, you can decide to cancel, adjust, or let the order execute based on other strategy logic
                 pass
 
-    def run(self):
-        """Main loop to continuously update alpha, manage inventory, and manage orders."""
-        while True:
-            self.update_short_term_alpha()
-            self.manage_inventory()
-            self.manage_orders()
+        
+
+#
+# Helpers
+#
+def round_to_tick(price):
+    """Ensure price is multiple of tick size"""
+    return round(price * 2) / 2
+
+def run() -> None:
+    order_manager = CustomOrderManager()
+
+    # Try/except just keeps ctrl-c from printing an ugly stacktrace
+    try:
+        order_manager.run_loop()
+        self.update_short_term_alpha()
+        self.manage_inventory()
+        self.manage_orders()
+    except (KeyboardInterrupt, SystemExit):
+        sys.exit()

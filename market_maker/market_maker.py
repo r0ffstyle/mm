@@ -239,6 +239,7 @@ class ExchangeInterface:
 class OrderManager:
     def __init__(self):
         self.exchange = ExchangeInterface(settings.DRY_RUN)
+        self.orders_init = False
         # Once exchange is created, register exit handler that will always cancel orders
         # on any error.
         atexit.register(self.exit)
@@ -466,6 +467,18 @@ class OrderManager:
             for order in reversed(to_cancel):
                 logger.info("%4s %d @ %.*f" % (order['side'], order['leavesQty'], tickLog, order['price']))
             self.exchange.cancel_orders(to_cancel)
+
+        response = self.exchange.create_orders(to_create)
+        for order, resp in zip(to_create, response):
+            self.open_orders[resp['orderID']] = order
+
+        response = self.exchange.amend_orders(to_amend)
+        for order, resp in zip(to_amend, response):
+            self.open_orders[resp['orderID']] = order
+
+        response = self.exchange.cancel_orders(to_cancel)
+        for resp in response:
+            del self.open_orders[resp['orderID']]
 
     ###
     # Position Limits

@@ -12,15 +12,43 @@ from market_maker.poloniex import PoloniexWebsocket
 from market_maker.hyperliquid import HyperLiquidWebsocket
 from market_maker.hyperliquid import HyperLiquidConnector
 
+from market_maker.difx import DIFXWebsocket
+
+# Test the code
+
+
+logging.basicConfig(level=logging.INFO)
+
+symbol = "ETH"
+
+hl = HyperLiquidWebsocket(symbol=symbol, testnet=False)
+hl.connect()
+time.sleep(2)
+hl.subscribe("l2Book", coin=symbol)  # Example subscription method for l2Book channel
+
+while True:
+    book = hl.data.get('l2Book')
+    if book:
+        print(book)
+    else:
+        logging.warning("No book data received.")
+    time.sleep(2)
 
 
 
+exit()
+symbol = "BTCUSDT"
+difx = DIFXWebsocket(symbol=symbol)
+difx.connect()
+time.sleep(2)
 
-
-
-
-
-
+try:
+    while difx.is_alive:
+        book = difx.get_order_book()
+        print(book)
+        time.sleep(5)  # Let's also give it some sleep time to not spam the server
+except KeyboardInterrupt:
+    difx.exit()
 
 
 
