@@ -128,6 +128,10 @@ class HyperLiquidWebsocket(HyperLiquidConnector):
         self.data = {}
         self.exited = False
         self.ws_open = False
+        self.open_orders = []
+        # Lock for thread safety
+        self.lock = threading.Lock()
+        self.order_fill_callback = None
         
     def connect(self):
         """Connect to the websocket in a thread."""
@@ -188,6 +192,11 @@ class HyperLiquidWebsocket(HyperLiquidConnector):
         self.logger.info(f"Websocket Opened at {self.endpoint}")
         self.ws_open = True  # Update WebSocket status on open
 
+    def set_order_fill_callback(self, callback):
+        """Set the callback function to be called when an order is filled."""
+        self.order_fill_callback = callback
+
+
     """
     Handlers
     """
@@ -242,9 +251,41 @@ class HyperLiquidWebsocket(HyperLiquidConnector):
     
     def handle_orderUpdates(self, data):
         """Handle data from the orderUpdates channel."""
-        self.data['orderUpdates'] = data
-        self.logger.debug(f"Order Updates: {self.data['orderUpdates']}")
-    
+        with self.lock:
+            for order_update in data:
+                order = order_update.get('order', {})
+                status = order_update.get('status', '')
+                oid = order.get('oid')
+
+                # Remove the order if it is filled or canceled
+                if status in ['filled', 'canceled', 'rejected', 'marginCanceled']:
+                    self.open_orders = [o for o in self.open_orders if o['oid'] != oid]
+                    # Check if the order was filled
+                    if status == 'filled':
+                        # If we have a callback set, call it
+                        if self.order_fill_callback:
+                            # Provide the order update info to the callback
+                            self.order_fill_callback(order_update)
+                else:
+                    # Update existing order or add new order
+                    existing_order = next((o for o in self.open_orders if o['oid'] == oid), None)
+                    if existing_order:
+                        existing_order.update(order)
+                        existing_order['status'] = status
+                        existing_order['statusTimestamp'] = order_update.get('statusTimestamp')
+                    else:
+                        # Add new order
+                        order['status'] = status
+                        order['statusTimestamp'] = order_update.get('statusTimestamp')
+                        self.open_orders.append(order)
+
+        self.logger.debug(f"Open Orders Updated: {self.open_orders}")
+
+    def get_cached_open_orders(self):
+        """Return the current list of open orders."""
+        with self.lock:
+            return list(self.open_orders)
+
     def handle_userFills(self, data):
         """Process data from the userFills channel."""
         self.data['userFills'] = data
@@ -364,10 +405,11 @@ def main():
         while True:
             """L2 book"""
             l2_book = hl_websocket.get_l2_book()
-            print(l2_book[0][0]['price'])
-            print(l2_book[0][0]['size'])
-            print(type(l2_book[0][0]['price'])) # String
-            print(type(l2_book[0][0]['size'])) # String
+            print(l2_book)
+            # print(l2_book[0][0]['price'])
+            # print(l2_book[0][0]['size'])
+            # print(type(l2_book[0][0]['price'])) # String
+            # print(type(l2_book[0][0]['size'])) # String
 
             # """Trades"""
             # trades = hl_websocket.get_trades()

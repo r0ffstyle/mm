@@ -38,6 +38,13 @@ class ExchangeInterface:
         self.HL.subscribe_to_trades()                           # Subscribe to the trades channel
         self.HL.subscribe_to_orderUpdates(keys.ETH_ADRESS)      # Subscribe to the orderUpdates channel
         self.HL.subscribe_to_userFills(keys.ETH_ADRESS)         # Subscribe to the userFills channel
+
+        # Fetch initial open orders via HTTP API
+        initial_open_orders = self.HL.get_open_orders()
+        with self.HL.lock:
+            self.HL.open_orders = initial_open_orders
+        logger.info(f"Initial open orders fetched: {initial_open_orders}")
+
     
     """
     HyperLiquid Methods
@@ -68,11 +75,11 @@ class ExchangeInterface:
         pass
 
     def get_open_HL_orders(self):
-        """Get users open orders"""
+        """Get user's open orders from the cache."""
         try:
-            return self.HL.get_open_orders()
+            return self.HL.get_cached_open_orders()
         except Exception as e:
-            logger.error(f"Error fetching open orders: {e}")
+            logger.error(f"Error fetching open orders from cache: {e}")
             return []
     
     def get_HL_order_updates(self):
@@ -81,6 +88,13 @@ class ExchangeInterface:
             return self.HL.get_orderUpdates()
         except Exception as e:
             logger.error(f"Error fetching order updates: {e}")
+    
+    def set_order_fill_callback(self, callback):
+        """Set the order fill callback function."""
+        try:
+            self.HL.set_order_fill_callback(callback)
+        except Exception as e:
+            logger.error(f"Error setting order fill callback: {e}")
 
     def get_HL_user_fills(self):
         """Get users fills."""

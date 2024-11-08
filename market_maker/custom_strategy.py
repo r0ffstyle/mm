@@ -11,30 +11,29 @@ from utils import log
 from main_maker import OrderManager
 from glft import GLFT, measure_trading_intensity
 
-#
-# Helpers
-#
+
 logger = log.setup_custom_logger('root')
 
 
-Q = 50 # Maximum inventory level
-order_size = 10
-order_pairs = 1
-tickSize = 0.0001 # WLD on HL
-loop_interval = 1.0 # In seconds, 100ms is lowest allowed
+Q = 75              # Maximum inventory level
+order_size = 10     # Order size of the given instrument
+tickSize = 0.0001   # WLD on HyperLiquid
+loop_interval = 0.1 # In seconds, 100ms is lowest allowed
 param_interval = 20 # How often to update parameters, in seconds
-buffer_size = 300 # In loop_interval ticks
-parameter_history = {'A' : [], 'kappa' : [], 'sigma' : []} # Temporary logging to analyze issue with parameter initialization
+buffer_size = 1000  # In loop_interval ticks
 
 class CustomOrderManager(OrderManager):
     def __init__(self):
         self.q = 0 # Inventory
         super().__init__()
 
-        self.adj1 = 0.0015 # Arbitrary, lower => lower half spread
-        self.adj2 = 0.5 # Arbitrary, affects skew which affects incentiveness to a neutral inventory
-        self.delta = 0.5 # Higher delta => lower half-spread
-        self.gamma = 1.0 #  1 <= gamma <= 10 is a typical range. Higher => wider spread
+        self.price_increment = tickSize * 10 # Increment to the next placed order
+        self.order_pairs = 5     # Amount of pairs to place in the book (bid, ask)
+
+        self.adj1 = 0.0015  # Arbitrary, lower => lower half spread
+        self.adj2 = 0.5     # Arbitrary, affects skew which affects incentiveness to a neutral inventory
+        self.delta = 0.5    # Higher delta => lower half-spread
+        self.gamma = 1.0    # 1 <= gamma <= 10 is a typical range. Higher => wider spread
         self.xi = self.gamma
         
         # Parameters to be calibrated
@@ -45,7 +44,7 @@ class CustomOrderManager(OrderManager):
         self.glft = GLFT(self.A, self.gamma, self.xi, self.sigma, self.kappa, Q, self.adj1, self.adj2, self.delta)
         self.ticks = np.arange(500) + 0.5 # Tick range for linear regression
 
-        # Buffers for trading intensity and volatility
+        # Buffers
         self.volatility_buffer = []
         self.trading_intensity_buffer = []
         self.buffer_size = buffer_size # In ticks
@@ -57,15 +56,17 @@ class CustomOrderManager(OrderManager):
         self.high_imbalance = 0.95
         self.low_imbalance = 0.05
 
-        # OBI parameters
-        self.beta = 0.001 # Scaling factor for alpha
+        # Orderbook imbalanace parameters
+        self.scale = 0.01 # Scaling factor for alpha signal
         self.oir_buffer = []
         self.voi_buffer = []
         self.price_change_buffer = []
         self.spread_buffer = []
-        self.buffer_size_oir = 1000  # Adjust as needed
+        self.buffer_size_oir = 1000
 
-        sleep(1)
+        self.exchange.set_order_fill_callback(self.on_order_filled)
+
+        sleep(1) # Allow the initialization to breathe
 
     """
     Binance
@@ -104,6 +105,16 @@ class CustomOrderManager(OrderManager):
     def get_positions(self):
         """Fetch user positions"""
         return self.exchange.get_HL_positions()
+    
+    def on_order_filled(self, order_update):
+        """Callback when an order is filled."""
+        print(f"Order update: {order_update}")
+        order = order_update.get('order', {})
+        print(f"Order: {order}")
+        order_id = order.get('oid')
+        is_buy = order.get('isBuy', True)  # Default to True if not present
+        side = 'B' if is_buy else 'A'
+        self.handle_order_fill(order_id, side)
 
     def get_mid_price(self):
         """Calculate mid price on HyperLiquid."""
@@ -122,6 +133,66 @@ class CustomOrderManager(OrderManager):
             logger.error(f"Error calculating mid price: {e}")
             return None
     
+    def get_queue_positions(self):
+        """Compute the queue positions for our bid and ask orders"""
+        book = self.get_book()
+        if not book or not book[0] or not book[1]:
+            logger.warning("Order book is incomplete")
+            return None, None
+
+        try:
+            # Get our open orders
+            existing_orders = self.exchange.get_open_HL_orders()
+
+            # Initialize queue positions
+            bid_queue_position = None
+            ask_queue_position = None
+
+            # Process bid and ask sides separately
+            for side in ['B', 'A']:
+                if side == 'B':
+                    # Bids
+                    book_side = book[0]
+                else:
+                    # Asks
+                    book_side = book[1]
+
+                # Get our order on this side
+                our_orders = [order for order in existing_orders if order['side'] == side]
+
+                if not our_orders:
+                    # No order on this side
+                    continue
+
+                our_order = our_orders[0]  # Assuming only one order per side
+                our_price = float(our_order['limitPx'])
+                our_size = float(our_order['sz'])
+
+                # Find total volume at our price level
+                total_volume_at_price = 0.0
+                for level in book_side:
+                    level_price = float(level['price'])
+                    level_size = float(level['size'])
+                    if level_price == our_price:
+                        total_volume_at_price = level_size
+                        break
+
+                # Estimate queue position assuming we are at the end of the queue
+                volume_ahead = total_volume_at_price - our_size
+                queue_position = volume_ahead / (total_volume_at_price + 1e-8)
+
+                if side == 'B':
+                    bid_queue_position = queue_position
+                else:
+                    ask_queue_position = queue_position
+
+            return bid_queue_position, ask_queue_position
+
+        except Exception as e:
+            logger.error(f"Error computing queue positions: {e}")
+            return None, None
+        
+    
     def compute_alpha(self):
         """Calculate alpha using regression based prediction of future price change"""
         # Ensure the regression model is available
@@ -129,32 +200,35 @@ class CustomOrderManager(OrderManager):
             logger.info("Regression model not available. Using default alpha of 0.")
             return 0
 
+        if not hasattr(self, 'model_feature_names'):
+            logger.error("Model feature names not found. Cannot compute alpha.")
+            return 0
+
         # Prepare the current feature vector
         try:
             # Get the latest features
-            spread = self.spread_buffer[-1] if self.spread_buffer else 0.0001  # Avoid division by zero
-            features = {
-                'VOI0': self.voi_buffer[-1],
-                'OIR0': self.oir_buffer[-1],
-                'Spread': spread
-            }
+            spread = self.spread_buffer[-1] if self.spread_buffer else 0.0001
 
-            # Add lagged features
+            # Initialize features dictionary with zeros
+            features = {feature: 0 for feature in self.model_feature_names}
+
+            # Update features with available data
+            features['VOI0'] = self.voi_buffer[-1]
+            features['OIR0'] = self.oir_buffer[-1]
+            features['spread'] = spread
+
             for lag in range(1, 6):
                 features[f'VOI{lag}'] = self.voi_buffer[-(lag+1)] if len(self.voi_buffer) > lag else 0
                 features[f'OIR{lag}'] = self.oir_buffer[-(lag+1)] if len(self.oir_buffer) > lag else 0
 
-            # Create DataFrame for prediction
-            X_pred = pd.DataFrame([features])
-            feature_columns = ['VOI0', 'VOI1', 'VOI2', 'VOI3', 'VOI4', 'VOI5',
-                               'OIR0', 'OIR1', 'OIR2', 'OIR3', 'OIR4', 'OIR5']
-            X_pred = X_pred[feature_columns]
+            # Create DataFrame for prediction using the model's feature names
+            X_pred = pd.DataFrame([features], columns=self.model_feature_names)
 
             # Predict price change
             predicted_price_change = self.regression_model.predict(X_pred)[0]
 
             # Compute alpha
-            alpha = self.beta * predicted_price_change
+            alpha = self.scale * predicted_price_change
             logger.info(f"Predicted price change: {predicted_price_change}, alpha: {alpha}")
             return alpha
 
@@ -190,10 +264,6 @@ class CustomOrderManager(OrderManager):
         I = np.where(Qb + Qa != 0, Qb / (Qb + Qa), 0)
         return I
     
-    def get_queue_position(self):
-        """Position in order book queue"""
-        pass
-    
     def get_market_order_imbalance(self):
         """Market order imbalance"""
         market_buy_orders = self.exchange.get_market_buy_orders()
@@ -203,117 +273,143 @@ class CustomOrderManager(OrderManager):
 
     def update_order_book_indicators(self):
         """Compute and store OIR, VOI, and related indicators."""
-        book = self.get_book()
-        if not book or not book[0] or not book[1]:
-            logger.warning("Order book is empty or incomplete.")
-            return
-
-        try:
-            # Best bid and ask prices and quantities
-            Pb = float(book[0][0]['price'])
-            Qb = float(book[0][0]['size'])
-            Pa = float(book[1][0]['price'])
-            Qa = float(book[1][0]['size'])
-            spread = Pa - Pb
-
-            # Mid-price
-            mid_price = (Pb + Pa) / 2.0
-
-            # Record spread
-            self.spread_buffer.append(spread)
-
-            # Compute OIR
-            oir = (Qb - Qa) / (Qb + Qa) if (Qb + Qa) != 0 else 0
-            self.oir_buffer.append(oir / spread if spread != 0 else 0)
-
-            # Compute VOI
-            delta_Qb = Qb - self.prev_Qb if hasattr(self, 'prev_Qb') else 0
-            delta_Qa = Qa - self.prev_Qa if hasattr(self, 'prev_Qa') else 0
-
-            # VOI calculation
-            voi = delta_Qb - delta_Qa
-            self.voi_buffer.append(voi / spread if spread != 0 else 0)
-
-            # Record previous bid and ask quantities
-            self.prev_Qb = Qb
-            self.prev_Qa = Qa
-
-            # Compute price change
-            if hasattr(self, 'prev_mid_price'):
-                price_change = mid_price - self.prev_mid_price
-                self.price_change_buffer.append(price_change)
-            self.prev_mid_price = mid_price
-
-            # Trim buffers
-            if len(self.oir_buffer) > self.buffer_size_oir:
-                self.oir_buffer.pop(0)
-            if len(self.voi_buffer) > self.buffer_size_oir:
-                self.voi_buffer.pop(0)
-            if len(self.price_change_buffer) > self.buffer_size_oir:
-                self.price_change_buffer.pop(0)
-            if len(self.spread_buffer) > self.buffer_size_oir:
-                self.spread_buffer.pop(0)
-
-        except (IndexError, KeyError, ValueError) as e:
-            logger.error(f"Error updating order book indicators: {e}")
-            
-    def update_regression_model(self):
-            """Update the regression model using the historical data."""
-            # Ensure we have enough data
-            MIN_DATA_POINTS = 50
-            buffer_lengths = {
-                'price_change_buffer': len(self.price_change_buffer),
-                'voi_buffer': len(self.voi_buffer),
-                'oir_buffer': len(self.oir_buffer),
-                'spread_buffer': len(self.spread_buffer)
-            }
-            logger.info(f"Buffer lengths: {buffer_lengths}")
-
-            # Calculate the minimum length accross all buffers
-            min_length = min(len(self.voi_buffer), len(self.oir_buffer), len(self.spread_buffer), len(self.price_change_buffer))
-
-            if len(self.price_change_buffer) < MIN_DATA_POINTS:
-                logger.info("Not enough data for regression. Skipping model update.")
+        with threading.Lock():
+            book = self.get_book()
+            if not book or not book[0] or not book[1]:
+                logger.warning("Order book is empty or incomplete.")
+                # Append np.nan to maintain buffer alignment
+                self.spread_buffer.append(np.nan)
+                self.oir_buffer.append(np.nan)
+                self.voi_buffer.append(np.nan)
+                self.price_change_buffer.append(np.nan)
                 return
 
-            # Prepare the data
-            df = pd.DataFrame({
-                'VOI0': self.voi_buffer[-min_length:],
-                'OIR0': self.oir_buffer[-min_length:],
-                'Spread': self.spread_buffer[-min_length:],
-                'PriceChange': self.price_change_buffer[-min_length:]
-            })
+            try:
+                # Best bid and ask prices and quantities
+                Pb = float(book[0][0]['price'])
+                Qb = float(book[0][0]['size'])
+                Pa = float(book[1][0]['price'])
+                Qa = float(book[1][0]['size'])
+                spread = Pa - Pb
+                self.spread_buffer.append(spread)
 
-            # Create lagged features
-            for lag in range(1, 6):
-                df[f'VOI{lag}'] = df['VOI0'].shift(lag)
-                df[f'OIR{lag}'] = df['OIR0'].shift(lag)
+                # Mid-price
+                mid_price = (Pb + Pa) / 2.0
 
-            # Drop NaN values due to shifting
-            df.dropna(inplace=True)
+                # Compute Order Imbalance Ratio
+                oir = (Qb - Qa) / (Qb + Qa) if (Qb + Qa) != 0 else 0
+                self.oir_buffer.append(oir)
 
-            # Features and target
-            feature_columns = ['VOI0', 'VOI1', 'VOI2', 'VOI3', 'VOI4', 'VOI5', 'OIR0', 'OIR1', 'OIR2', 'OIR3', 'OIR4', 'OIR5']
-            X = df[feature_columns]
-            y = df['PriceChange']
+                # Compute Volume Order Imbalance
+                delta_Qb = Qb - self.prev_Qb if hasattr(self, 'prev_Qb') else 0
+                delta_Qa = Qa - self.prev_Qa if hasattr(self, 'prev_Qa') else 0
 
-            # Fit the regression model
-            self.regression_model = LinearRegression()
-            self.regression_model.fit(X, y)
+                # VOI calculation
+                voi = delta_Qb - delta_Qa
+                self.voi_buffer.append(voi)
 
-            # Log the model coefficients
-            logger.info(f"Regression coefficients: {self.regression_model.coef_}")
+                # Record previous bid and ask quantities
+                self.prev_Qb = Qb
+                self.prev_Qa = Qa
+
+                # Compute price change
+                if hasattr(self, 'prev_mid_price'):
+                    price_change = mid_price - self.prev_mid_price
+                    self.price_change_buffer.append(price_change)
+                else:
+                    self.price_change_buffer.append(0)
+                self.prev_mid_price = mid_price
+
+
+            except (IndexError, KeyError, ValueError) as e:
+                logger.error(f"Error updating order book indicators: {e}")
+                # Append np.nan to maintain buffer alignment
+                self.spread_buffer.append(np.nan)
+                self.oir_buffer.append(np.nan)
+                self.voi_buffer.append(np.nan)
+                self.price_change_buffer.append(np.nan)
+
+            # Trim buffers
+            max_buffer_length = self.buffer_size_oir
+            self.spread_buffer = self.spread_buffer[-max_buffer_length:]
+            self.oir_buffer = self.oir_buffer[-max_buffer_length:]
+            self.voi_buffer = self.voi_buffer[-max_buffer_length:]
+            self.price_change_buffer = self.price_change_buffer[-max_buffer_length:]
+            
+    def update_regression_model(self):
+        """Update the regression model using the historical data."""
+        # Ensure we have enough data
+        MIN_DATA_POINTS = 50
+        buffer_lengths = {
+            'price_change_buffer': len(self.price_change_buffer),
+            'voi_buffer': len(self.voi_buffer),
+            'oir_buffer': len(self.oir_buffer),
+            'spread_buffer': len(self.spread_buffer)
+        }
+        logger.info(f"Buffer lengths: {buffer_lengths}")
+
+        # Calculate the minimum length across all buffers
+        min_length = min(buffer_lengths.values())
+
+        if min_length < MIN_DATA_POINTS:
+            logger.info("Not enough data for regression. Skipping model update.")
+            return
+
+        # Prepare the data
+        data = {
+            'VOI0': self.voi_buffer[-min_length:],
+            'spread': self.spread_buffer[-min_length:],
+            'PriceChange': self.price_change_buffer[-min_length:]
+        }
+
+        # Convert data to DataFrame
+        df = pd.DataFrame(data)
+        df.dropna(inplace=True)
+
+        # Check if we have enough data after dropping NaNs
+        if len(df) < MIN_DATA_POINTS:
+            logger.info("Not enough valid data after dropping NaNs. Skipping model update.")
+            return
+
+        # Create lagged features
+        for lag in range(1, 6):
+            df[f'VOI{lag}'] = df['VOI0'].shift(lag)
+
+        # Drop rows with NaN values introduced by shifting
+        df.dropna(inplace=True)
+
+        # Define feature columns
+        feature_columns = ['VOI0', 'VOI4', 'VOI5', 'spread']
+
+        # Prepare data for regression
+        X = df[feature_columns]
+        y = df['PriceChange']
+
+        # Fit the regression model
+        self.regression_model = LinearRegression()
+        self.regression_model.fit(X, y)
+
+        # Store the feature names used in the model
+        self.model_feature_names = feature_columns
+
+        # Log the model coefficients
+        logger.info(f"Regression coefficients: {self.regression_model.coef_}")
 
 ##########
 # Orders #
 ##########
     def prepare_order(self, side, level, optimal_bid, optimal_ask):
-        """Create an order object using GLFT model prices with adjustments for each level."""
-        level_adjustment = abs(level - 1) * tickSize
+        """Create an order object."""
         if side == 'B':
-            adjusted_price = optimal_bid - level_adjustment
+            # Place bids in decreasing fashion from the optimal bid
+            adjusted_price = optimal_bid - (level - 1) * self.price_increment
         else:
-            adjusted_price = optimal_ask + level_adjustment
+            # Place asks in increasing fashion from the optimal ask
+            adjusted_price = optimal_ask + (level - 1) * self.price_increment
+        
+        # Ensure the price is valid
+        adjusted_price = max(adjusted_price, 0)
+
         return {
             'price': round_to_tick(adjusted_price),
             'orderQty': order_size,
@@ -326,87 +422,135 @@ class CustomOrderManager(OrderManager):
         buy_orders = []
         sell_orders = []
         optimal_bid, optimal_ask = self.optimal_quotes()
+        if optimal_bid is None or optimal_ask is None:
+            logger.info("Optimal quotes are not available. Skipping order placement.")
+            return
         logger.info(f"Spread = {round(optimal_ask - optimal_bid, 5)}")
-        # Orders are created/amended from outside-in. This approach minimizes amendments, as innermost orders (closer to market price and more likely to be filled) are adjusted last. It efficiently manages order placement, reducing unnecessary adjustments and aligning with market activity probabilities.
-        for i in reversed(range(1, order_pairs + 1)):
+
+        for i in range(1, self.order_pairs + 1):
             if not self.long_position_limit_exceeded():
-                buy_order = self.prepare_order('B', -i, optimal_bid, optimal_ask)
+                buy_order = self.prepare_order('B', i, optimal_bid, optimal_ask)
                 if buy_order is not None:
                     buy_orders.append(buy_order)
             else:
-                logger.info("Long position exceeded")
+                logger.info("Long position limit exceeded.")
+            
             if not self.short_position_limit_exceeded():
                 sell_order = self.prepare_order('A', i, optimal_bid, optimal_ask)
                 if sell_order is not None:
                     sell_orders.append(sell_order)
-            else:
-                logger.info("Short position exceeded")
+                else:
+                    logger.info("Short position limit exceeded")
         
         return self.converge_orders(buy_orders, sell_orders)
+
+    def handle_order_fill(self, order_id, side):
+        """Handle the event when an order is filled and place a immediate new order to maintain presence."""
+        logger.info(f"Order {order_id} on side {side} filled.")
+        optimal_bid, optimal_ask = self.optimal_quotes()
+        if optimal_bid is None or optimal_ask is None:
+            logger.warning("Optimal quotes not available. Skipping placing new order.")
+            return
+
+        if side == 'B':
+            if not self.long_position_limit_exceeded():
+                # Place a new bid order at the optimal level
+                new_order = self.prepare_order('B', 1, optimal_bid, optimal_ask)
+                self.exchange.place_HL_order(new_order['side'], new_order['orderQty'], new_order['price'])
+        else:
+            if not self.short_position_limit_exceeded():
+                # Place a new ask order at the optimal level
+                new_order = self.prepare_order('A', 1, optimal_bid, optimal_ask)
+                self.exchange.place_HL_order(new_order['side'], new_order['orderQty'], new_order['price'])
 
     def converge_orders(self, buy_orders, sell_orders):
         """
         Converge the current orders with the desired orders.
-        This method amends, creates, or cancels orders to match the desired state.
+        This function amends, creates, or cancels orders to match the desired state.
 
         Parameters:
         buy_orders (list): The list of desired buy orders.
         sell_orders (list): The list of desired sell orders.
         """
         logger.info("Converging orders...")
-        # Initialize lists for order actions and match counters
+        # Initialize lists for order actions
         to_amend = []  # Orders to be amended
         to_create = []  # Orders to be created
         to_cancel = []  # Orders to be cancelled
-        buys_matched = 0  # Counter for buy orders matched with existing orders
-        sells_matched = 0  # Counter for sell orders matched with existing orders
-
 
         # Fetch the current open orders from HyperLiquid
         existing_orders = self.exchange.get_open_HL_orders()
 
-        # Iterate through existing orders to check if they match the desired orders
-        for order in existing_orders:
-            try:
-                # Determine if the existing order is a buy or sell order
-                is_buy = order['side'] == 'B'
-                desired_order = buy_orders[buys_matched] if is_buy else sell_orders[sells_matched]
+        # Separate existing orders into buys and sells
+        existing_buy_orders = [order for order in existing_orders if order['side'] == 'B']
+        existing_sell_orders = [order for order in existing_orders if order['side'] == 'A']
 
-                # Increment the matched order counter
-                buys_matched += is_buy
-                sells_matched += not is_buy
-
-                # Check if the existing order needs to be amended (quantity or price change)
-                if desired_order['orderQty'] != order['sz'] or round_to_tick(desired_order['price']) != round_to_tick(float(order['limitPx'])):
-                    # Add the order to the amendment list
+        # Process buy orders
+        buys_matched = 0
+        for idx, desired_order in enumerate(buy_orders):
+            if idx < len(existing_buy_orders):
+                existing_order = existing_buy_orders[idx]
+                # Compare and decide whether to amend
+                price_difference = abs(desired_order['price'] - float(existing_order['limitPx']))
+                if desired_order['orderQty'] != existing_order['sz'] or price_difference > (self.price_increment / 2):
+                    # Only amend if there's a significant change
                     to_amend.append({
-                        'oid': order['oid'],
-                        'is_buy': is_buy,
+                        'oid': existing_order['oid'],
+                        'is_buy': True,
                         'orderQty': desired_order['orderQty'],
                         'price': desired_order['price'],
                         'type': 'limit'
                     })
-            except IndexError:
-                # Add orders to cancellation list if there's no matching desired order
-                to_cancel.append(order)
+                buys_matched += 1
+            else:
+                # No existing order at this index, so create the desired order
+                to_create.append(desired_order)
 
-        # Add any remaining unmatched desired orders to the creation list
-        to_create += buy_orders[buys_matched:] + sell_orders[sells_matched:]
+        # Any extra existing buy orders need to be cancelled
+        for existing_order in existing_buy_orders[buys_matched:]:
+            to_cancel.append(existing_order)
+
+        # Process sell orders
+        sells_matched = 0
+        for idx, desired_order in enumerate(sell_orders):
+            if idx < len(existing_sell_orders):
+                existing_order = existing_sell_orders[idx]
+                # Compare and decide whether to amend
+                price_difference = abs(desired_order['price'] - float(existing_order['limitPx']))
+                if desired_order['orderQty'] != existing_order['sz'] or price_difference > (self.price_increment / 2):
+                    # Only amend if there's a significant change
+                    to_amend.append({
+                        'oid': existing_order['oid'],
+                        'is_buy': False,
+                        'orderQty': desired_order['orderQty'],
+                        'price': desired_order['price'],
+                        'type': 'limit'
+                    })
+                sells_matched += 1
+            else:
+                # No existing order at this index, so create the desired order
+                to_create.append(desired_order)
+
+        # Any extra existing sell orders need to be cancelled
+        for existing_order in existing_sell_orders[sells_matched:]:
+            to_cancel.append(existing_order)
 
         # Amend orders if there are any in the amendment list
-        if len(to_amend) > 0:
+        if to_amend:
             logger.info(f"Amending {len(to_amend)} orders...")
             for order in to_amend:
-                self.exchange.amend_HL_order(order['oid'], order['is_buy'], order['orderQty'], order['price'], order['type'])
+                self.exchange.amend_HL_order(
+                    order['oid'], order['is_buy'], order['orderQty'], order['price'], order['type']
+                )
 
         # Create new orders if there are any in the creation list
-        if len(to_create) > 0:
+        if to_create:
             logger.info(f"Creating {len(to_create)} new orders...")
             for order in to_create:
                 self.exchange.place_HL_order(order['side'], order['orderQty'], order['price'])
 
         # Cancel orders if there are any in the cancellation list
-        if len(to_cancel) > 0:
+        if to_cancel:
             logger.info(f"Cancelling {len(to_cancel)} orders...")
             for order in to_cancel:
                 self.exchange.cancel_HL_order(order['oid'])
@@ -425,9 +569,6 @@ class CustomOrderManager(OrderManager):
         logger.info(f"Volatility: {self.glft.sigma:.5f}")
         logger.info(f"Market Order Arrival Rate (A): {self.glft.A:.5f}")
         logger.info(f"Liquidity Intensity (kappa): {self.glft.kappa:.5f}")
-        parameter_history['sigma'].append(self.glft.sigma)
-        parameter_history['A'].append(self.glft.A)
-        parameter_history['kappa'].append(self.glft.kappa)
 
         # Trim data to prevent lists from growing indefinitely
         MAX_DATA_POINTS = self.buffer_size
@@ -570,13 +711,6 @@ def round_to_tick(price):
 ##########
 # Runners #
 ##########
-import pickle
-def save_parameter_history(filename='parameter_history.pkl'):
-    """Save the parameter history to a file."""
-    with open(filename, 'wb') as f:
-        pickle.dump(parameter_history, f)
-    logger.info(f"Parameter history saved to {filename}.")
-
 def run():
     logger.info('Starting the market maker...')
     order_manager = CustomOrderManager()
@@ -587,7 +721,6 @@ def run():
         logger.info("Shutting down the market maker...")
         if order_manager.parameter_update_timer:
             order_manager.parameter_update_timer.cancel()
-        save_parameter_history()
         order_manager.exit()
 
 if __name__ == "__main__":
