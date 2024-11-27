@@ -112,22 +112,64 @@ class ExchangeInterface:
             logger.error(f"Error fetching users positions: {e}")
     
     def place_HL_order(self, side, quantity, price):
-        """Orderplacing"""
+        """Place a limit order on HyperLiquid and return the order ID if successful."""
         try:
             is_buy = True if side == 'B' else False
-            order = self.HL.limit_order(is_buy, quantity, price)
+            response = self.HL.limit_order(is_buy, quantity, price)
             logger.info(f"Placing order: {side} {quantity} @ {price}")
-            return order
+
+            # Check if response is not None
+            if response is None:
+                logger.error("No response received from limit_order")
+                return None
+
+            # Parse the response to extract oid
+            if response.get('status') == 'ok':
+                # Navigate the response to get the oid
+                statuses = response.get('response', {}).get('data', {}).get('statuses', [])
+                if statuses and 'resting' in statuses[0]:
+                    oid = statuses[0]['resting'].get('oid')
+                    if oid is not None:
+                        logger.info(f"Order placed successfully, oid: {oid}")
+                        return oid
+                elif statuses and 'filled' in statuses[0]:
+                    oid = statuses[0]['filled'].get('oid')
+                    if oid is not None:
+                        logger.info(f"Order filled immediately, oid: {oid}")
+                        return oid
+                else:
+                    logger.error(f"Unexpected response structure: {response}")
+                    return None
+            else:
+                # Handle error response
+                error_message = response.get('error', {}).get('message', 'Unknown error')
+                logger.error(f"Error placing order: {error_message}")
+                return None
         except Exception as e:
-            logger.error(f"Error placing order: {e}")
+            logger.error(f"Exception in place_HL_order: {e}")
             return None
 
     def cancel_HL_order(self, order_id):
-        """Cancel single order"""
+        """Cancel a single order on HyperLiquid and return True if successful."""
         try:
-            return self.HL.cancel_order(order_id)
+            response = self.HL.cancel_order(order_id)
+            logger.info(f"Cancelling order with oid: {order_id}")
+
+            if response is None:
+                logger.error("No response received from cancel_order")
+                return False
+
+            # Parse the response to check if cancellation was successful
+            if response.get('status') == 'ok':
+                logger.info(f"Order {order_id} cancelled successfully.")
+                return True
+            else:
+                error_message = response.get('error', {}).get('message', 'Unknown error')
+                logger.error(f"Error cancelling order: {error_message}")
+                return False
         except Exception as e:
-            logger.error(f"Error cancelling order: {e}")
+            logger.error(f"Exception in cancel_HL_order: {e}")
+            return False
 
     def cancel_all_HL_orders(self):
         """Cancel all orders on HyperLiquid."""
@@ -138,16 +180,31 @@ class ExchangeInterface:
         except Exception as e:
             logger.error(f"Error cancelling all HyperLiquid orders: {e}")
     
-    def amend_HL_order(self, order_id, is_buy, size, price, order_type):
-        """Modify order on HyperLiquid"""
+    def amend_HL_order(self, order_id, is_buy, size, price, order_type, tif=None, trigger_price=None):
+        """Modify an order on HyperLiquid and return True if successful."""
         try:
-            if order_id is None or is_buy is None or size is None or price is None or order_type is None:
-                raise ValueError("Amending failed because a None is returned")
-            return self.HL.modify_order(order_id, is_buy, size, price, order_type)
-        
+            if None in [order_id, is_buy, size, price, order_type]:
+                raise ValueError("Amending failed because one of the parameters is None")
+
+            response = self.HL.modify_order(order_id, is_buy, size, price, order_type, tif, trigger_price)
+            logger.info(f"Modifying order {order_id}: is_buy={is_buy}, size={size}, price={price}, type={order_type}")
+
+            if response is None:
+                logger.error("No response received from modify_order")
+                return False
+
+            # Parse the response to check if modification was successful
+            if response.get('status') == 'ok':
+                logger.info(f"Order {order_id} modified successfully.")
+                return True
+            else:
+                error_message = response.get('error', {}).get('message', 'Unknown error')
+                logger.error(f"Error modifying order: {error_message}")
+                return False
         except Exception as e:
-            logger.error(f"Error modifying order: {e}")
-            return None
+            logger.error(f"Exception in amend_HL_order: {e}")
+            return False
+
 
     def ensure_HL_ws_connected(self):
         """Make sure the connection to the HyperLiquid WebSocket stays open"""
@@ -286,7 +343,6 @@ class OrderManager:
         # Amend orders if there are any in the amendment list
         if len(to_amend) > 0:
             for order in to_amend:
-                print(f"AMEND THIS BITCH {order}")
                 self.exchange.amend_HL_order(order['orderID'], order['is_buy'], order['quantity'], order['price'], order['type'])
 
         # Create new orders if there are any in the creation list

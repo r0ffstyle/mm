@@ -95,13 +95,31 @@ class GLFT:
 
 
     def calibrate_parameters(self, arrival_depth, mid_price_chg, t, ticks):
+        min_depth = min(arrival_depth)
+        max_depth = max(arrival_depth)
+
+        num_bins = 10  # Desired number of bins
+        bins = np.linspace(min_depth, max_depth, num_bins + 1)
+        counts, _ = np.histogram(arrival_depth, bins=bins)
+
         lambda_ = measure_trading_intensity(arrival_depth)
-        lambda_ = lambda_ / 600  # Adjust this scaling factor if necessary
-        x = ticks[:len(lambda_)]
-        y = np.log(np.where(lambda_ > 0, lambda_, 1e-8))  # Avoid log(0)
+        # lambda_ = lambda_ / 600  # Adjust this scaling factor if necessary
+        lambda_ = counts / 600
+        # x = ticks[:len(lambda_)]
+        # Compute bin centers
+        bin_centers = (bins[:-1] + bins[1:]) / 2
+
+        # Filter out zero lambda_ values
+        mask = lambda_ > 0
+        x = bin_centers[mask]
+        lambda_ = lambda_[mask]
+        print(f"lambda_: {lambda_}")
+        y = np.log(lambda_)
         k_, logA = linear_regression(x, y)
         self.A = np.exp(logA)
-        self.kappa = -k_
+        self.kappa = -k_ # TODO kappa is extremely inflated
+        print("A and kappa:")
+        print(self.A, self.kappa)
 
         if self.A <= 0 or self.kappa <= 0:
             logger.warning("Invalid A or kappa. Using default values.")
@@ -109,7 +127,6 @@ class GLFT:
             self.kappa = max(self.kappa, 0.2)
 
         if t > 1:  # Ensure at least one change exists
-            self.sigma = np.nanstd(mid_price_chg)# * np.sqrt(10) # *sqrt(10) to adjust for 100ms
+            self.sigma = np.nanstd(mid_price_chg) * np.sqrt(10) # *sqrt(10) to adjust for 100ms
         else:
             self.sigma = 0
-        

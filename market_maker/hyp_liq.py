@@ -45,9 +45,11 @@ class HyperLiquidConnector:
     """
     def limit_order(self, is_buy, size, price):
         try:
-            return self.ex.order(self.symbol, is_buy, size, price, {"limit": {"tif": "Gtc"}})
+            response = self.ex.order(self.symbol, is_buy, size, price, {"limit": {"tif": "Gtc"}})
+            return response
         except Exception as err:
             print(f"Error: {err}")
+            return None
 
     def market_order(self, is_buy, size, trigger_price):
         try:
@@ -132,19 +134,26 @@ class HyperLiquidWebsocket(HyperLiquidConnector):
         # Lock for thread safety
         self.lock = threading.Lock()
         self.order_fill_callback = None
+        self.command_queue = []
         
     def connect(self):
         """Connect to the websocket in a thread."""
+        if self.ws_open:
+            self.logger.debug("WebSocket is already open.")
+            return
+
         self.logger.debug("Starting WebSocket thread.")
-        self.ws = websocket.WebSocketApp(self.endpoint,
-                                         on_message=self.on_message,
-                                         on_close=self.on_close,
-                                         on_open=self.on_open,
-                                         on_error=self.on_error)
+        self.ws = websocket.WebSocketApp(
+            self.endpoint,
+            on_message=self.on_message,
+            on_close=self.on_close,
+            on_open=self.on_open,
+            on_error=self.on_error
+        )
         self.thread = threading.Thread(target=lambda: self.ws.run_forever())
         self.thread.daemon = True
         self.thread.start()
-        time.sleep(3)  # Wait for the connection to establish
+        time.sleep(1)  # Give time for the connection to establish
 
     def exit(self):
         """Exit and close WebSocket."""
@@ -154,8 +163,9 @@ class HyperLiquidWebsocket(HyperLiquidConnector):
     def send_command(self, command):
         """Send a raw command."""
         if not self.ws.sock or not self.ws_open:
-            self.logger.debug("WebSocket is not open. Attempting to reconnect...")
-            self.connect()
+            self.logger.debug("WebSocket is not open. Queuing command.")
+            self.command_queue.append(command)
+            return
         self.ws.send(json.dumps(command))
 
     def on_message(self, ws, message):
@@ -180,11 +190,12 @@ class HyperLiquidWebsocket(HyperLiquidConnector):
         if not self.exited:
             self.logger.error(f"Error: {error}")
             self.ws_open = False  # Update WebSocket status on error
-            raise websocket.WebSocketException(error)
 
-    def on_close(self, ws):
+    def on_close(self, ws, close_status_code, close_msg):
         """Handle WS close."""
         self.logger.info(f'Websocket Closed at {self.endpoint}')
+        self.logger.info(f"Close status code: {close_status_code}")
+        self.logger.info(f"Close message: {close_msg}")
         self.ws_open = False  # Update WebSocket status on close
 
     def on_open(self, ws):
@@ -192,10 +203,18 @@ class HyperLiquidWebsocket(HyperLiquidConnector):
         self.logger.info(f"Websocket Opened at {self.endpoint}")
         self.ws_open = True  # Update WebSocket status on open
 
+        # Send any queued commands
+        while self.command_queue:
+            command = self.command_queue.pop(0)
+            self.ws.send(json.dumps(command))
+
+        # Subscribe to channels
+        self.subscribe_to_userFills(self.account.address)
+        # Add other subscriptions if needed
+
     def set_order_fill_callback(self, callback):
         """Set the callback function to be called when an order is filled."""
         self.order_fill_callback = callback
-
 
     """
     Handlers
@@ -288,8 +307,30 @@ class HyperLiquidWebsocket(HyperLiquidConnector):
 
     def handle_userFills(self, data):
         """Process data from the userFills channel."""
-        self.data['userFills'] = data
-        self.logger.debug(f"User Fills: {self.data['userFills']}")
+        with self.lock:
+            fills = data.get('fills', [])
+            for fill in fills:
+                # Prepare the order update data structure
+                order_update = {
+                    'order': {
+                        'oid': fill['oid'],
+                        'limitPx': fill['px'],
+                        'sz': fill['sz'],  # Size filled in this fill
+                        'origSz': fill['sz'],  # Total size filled in this fill
+                        'isBuy': fill['side'] == 'B',
+                        'timestamp': fill['time']
+                    },
+                    'status': 'fill',  # Use 'fill' to indicate a fill event
+                    'statusTimestamp': fill['time']
+                }
+
+                # If we have a callback set, call it
+                if self.order_fill_callback:
+                    # Provide the order update info to the callback
+                    self.order_fill_callback(order_update)
+
+        self.logger.debug(f"User Fills: {fills}")
+
     
     def send_heartbeat(self):
         self.ws.send(json.dumps({"method": "ping"}))
@@ -404,8 +445,8 @@ def main():
     try:
         while True:
             """L2 book"""
-            l2_book = hl_websocket.get_l2_book()
-            print(l2_book)
+            # l2_book = hl_websocket.get_l2_book()
+            # print(l2_book)
             # print(l2_book[0][0]['price'])
             # print(l2_book[0][0]['size'])
             # print(type(l2_book[0][0]['price'])) # String
@@ -420,14 +461,14 @@ def main():
             # if volatility:
             #     print(volatility)
             #     print(f"Volatiltiy: {round(volatility, 4) * 100}%")
-            time.sleep(2)
-            # print('Placing order...')
-            # order = {'is_buy': True, 'size': 10, 'price': 1.8199}
-            # order = hl_websocket.limit_order(order["is_buy"], order["size"], order['price'])
-            # print(order)
+            print('Placing order...')
+            order = {'is_buy': True, 'size': 10, 'price': 2.6270}
+            order = hl_websocket.limit_order(order["is_buy"], order["size"], order['price'])
+            print(order)
 
             """Metadata"""
             # print(meta)
+            time.sleep(2)
 
 
     except KeyboardInterrupt:
