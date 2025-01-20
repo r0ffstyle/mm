@@ -9,4 +9,4 @@ This repository contains files for a market-making strategy. However, **only the
 - `binance_api.py`: Binance API script.
 
 ### Note
-The rest of the files are completely irrelevant, but GitHub forces them here. Consider them utterly useless!
+The rest of the files are completely irrelevant.
